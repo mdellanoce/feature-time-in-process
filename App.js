@@ -133,23 +133,20 @@ function Feature() {
     var typeHierarchy = 'PortfolioItem/Feature';
     this.progressPredicate = function() {
         return {
-            // Features in development and < 100 % done
+            // Features in development, but not turned on for all customers yet
             '_TypeHierarchy': typeHierarchy,
-            'State': 'In Dev',
-            'PercentDoneByStoryCount': {
-                '$lt': 1,
-                '$gt': 0
+            'State': {
+                '$gte': 'In Dev',
+                '$lt': 'Toggled On for all'
             }
         };
     };
     this.completePredicate = function() {
         return {
-            // Features not in development anymore or >= 100% done
+            // Features with actual start/end dates set
             '_TypeHierarchy': typeHierarchy,
-            '$or': [
-                { 'State': { '$gt': 'In Dev' } },
-                { 'PercentDoneByStoryCount': { '$gte': 1 } }
-            ]
+            'ActualEndDate': { '$exists': true },
+            'ActualStartDate': { '$exists': true }
         };
     };
 }
@@ -194,7 +191,7 @@ Ext.define('CustomApp', {
         //Time range is epoch to current month
         startOn: '2011-12',
         endBefore: new Time(new Date()).inGranularity(Time.MONTH).toString(),
-        xAxis: 'month',
+        xAxis: 'fiscalQuarter',
         type: 'PortfolioItem/Feature'
     },
 
@@ -235,7 +232,8 @@ Ext.define('CustomApp', {
         this._showChart();
 
         Deft.Promise.all([
-            this._getTISCSnapshots(),
+            //this._getTISCSnapshots(),
+            this._getFeatureSnapshots(),
             this._getCompletedOids()
         ]).then({
             success: Ext.bind(this._onLoad, this)
@@ -259,7 +257,7 @@ Ext.define('CustomApp', {
         }, this);
 
         var getCategory = Ext.bind(function(row) {
-            return this._xAxisStrategy.categorize(row);
+            return this._xAxisStrategy.categorize(row.ActualEndDate_lastValue);
         }, this);
 
         var deriveFieldsOnOutput = Ext.Array.map([25, 50, 75], function(percentile) {
@@ -288,7 +286,8 @@ Ext.define('CustomApp', {
         });
 
         var tiscResultsFilteredByCompletion = Ext.Array.filter(tiscResults, function(result) {
-            return !!completedOids[result.ObjectID];
+            //return !!completedOids[result.ObjectID];
+            return true;
         });
 
         cube.addFacts(tiscResultsFilteredByCompletion);
@@ -342,6 +341,29 @@ Ext.define('CustomApp', {
         return deferred.getPromise();
     },
 
+    _getFeatureSnapshots: function() {
+        var deferred = new Deft.Deferred();
+        Ext.create('Rally.data.lookback.SnapshotStore', {
+            autoLoad : true,
+            limit: Infinity,
+            listeners: {
+                refresh: function(store) {
+                    //Extract the raw snapshot data...
+                    var snapshots = [];
+                    for (var i = 0, ii = store.getTotalCount(); i < ii; ++i) {
+                        snapshots.push(store.getAt(i).data);
+                    }
+                    deferred.resolve(snapshots);
+                }
+            },
+            fetch: ['ObjectID', 'ActualStartDate', 'ActualEndDate'],
+            find: this._getProjectScopedQuery(Ext.merge({
+                '__At': this.getEndBefore()
+            }, this._typeStrategy.completePredicate()))
+        });
+        return deferred.getPromise();
+    },
+
     _getCompletedOids: function(type, afterCompletedOIDs){
         var deferred = new Deft.Deferred();
         Ext.create('Rally.data.lookback.SnapshotStore', {
@@ -369,16 +391,20 @@ Ext.define('CustomApp', {
         var config = {
             granularity: 'hour',
             tz: this._workspaceConfig.TimeZone,
-            workDays: this._workspaceConfig.WorkDays.split(','),
+            //workDays: this._workspaceConfig.WorkDays.split(','),
+            workDays: ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'],
             endBefore: this.getEndBefore(),
 
             // assume 9-5
             workDayStartOn: {hour: 9, minute: 0},
             workDayEndBefore: {hour: 17, minute: 0},
 
-            holidays: this._federalHolidays(),
+            //holidays: this._federalHolidays(),
 
-            trackLastValueForTheseFields: [this._xAxisStrategy.field]
+            validFromField: 'ActualStartDate',
+            validToField: 'ActualEndDate',
+
+            trackLastValueForTheseFields: ['ActualEndDate']
         };
 
         // store number of hours in a work day
