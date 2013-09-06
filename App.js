@@ -131,31 +131,52 @@ function FeatureSize() {
 
 function Feature() {
     var typeHierarchy = 'PortfolioItem/Feature';
+    this.stateField = 'State';
+    var states = [
+        'Backlog',
+        'Prep',
+        'Ready for Dev',
+        'In Dev',
+        'Rally 100',
+        'Limited Release',
+        'Enablement',
+        'Toggled On for all',
+        'Toggle Removed',
+        'Archived'
+    ];
+    this.states = states;
     this.progressPredicate = function() {
         return {
-            // Features in development and < 100 % done
+            // Features not toggled on for all
             '_TypeHierarchy': typeHierarchy,
-            'State': 'In Dev',
-            'PercentDoneByStoryCount': {
-                '$lt': 1,
-                '$gt': 0
+            'State': {
+                '$gte': states[0],
+                '$lt': states[7]
             }
         };
     };
     this.completePredicate = function() {
         return {
-            // Features not in development anymore or >= 100% done
+            // Features toggled on for all
             '_TypeHierarchy': typeHierarchy,
-            '$or': [
-                { 'State': { '$gt': 'In Dev' } },
-                { 'PercentDoneByStoryCount': { '$gte': 1 } }
-            ]
+            'State': {
+                '$gte': states[7]
+            }
         };
     };
 }
 
 function HierarchicalRequirement() {
     var typeHierarchy = 'HierarchicalRequirement';
+    this.stateField = 'ScheduleState';
+    this.states = [
+        'Idea',
+        'Defined',
+        'In-Progress',
+        'Completed',
+        'Accepted',
+        'Released'
+    ];
     this.progressPredicate = function() {
         return {
             // Leaf stories in progress
@@ -195,7 +216,9 @@ Ext.define('CustomApp', {
         startOn: '2011-12',
         endBefore: new Time(new Date()).inGranularity(Time.MONTH).toString(),
         xAxis: 'month',
-        type: 'PortfolioItem/Feature'
+        type: 'PortfolioItem/Feature',
+        workDays: undefined,
+        holidays: undefined
     },
 
     constructor: function(config) {
@@ -252,7 +275,16 @@ Ext.define('CustomApp', {
         var snapshots = loaded[0];
         var completedOids = loaded[1];
 
-        var tiscResults = this._getTISCResults(snapshots);
+        var tiscResults = {};
+
+        tiscResults['all'] = this._getTISCResults(snapshots);
+        var typeStrategy = this._typeStrategy;
+        Ext.each(typeStrategy.states, function(state) {
+            var filteredSnapshots = Ext.Array.filter(snapshots, function(snapshot) {
+                return snapshot[typeStrategy.stateField] === state;
+            });
+            tiscResults[state] = this._getTISCResults(filteredSnapshots);
+        }, this);
 
         var convertTicksToHours = Ext.bind(function(row) {
             return row.ticks / this._workDayHours;
@@ -283,15 +315,18 @@ Ext.define('CustomApp', {
             ],
             deriveFieldsOnOutput: deriveFieldsOnOutput,
             dimensions: [
-                { field: "category" }
+                { field: "category" },
+                { field: "state" }
             ]
         });
 
-        var tiscResultsFilteredByCompletion = Ext.Array.filter(tiscResults, function(result) {
-            return !!completedOids[result.ObjectID];
+        Ext.Object.each(tiscResults, function(state, results) {
+            var tiscResultsFilteredByCompletion = Ext.Array.filter(results, function(result) {
+                result.state = state;
+                return !!completedOids[result.ObjectID];
+            });
+            cube.addFacts(tiscResultsFilteredByCompletion);
         });
-
-        cube.addFacts(tiscResultsFilteredByCompletion);
 
         this._showChartData(cube);
     },
@@ -331,7 +366,8 @@ Ext.define('CustomApp', {
                     deferred.resolve(snapshots);
                 }
             },
-            fetch: ['ObjectID', '_ValidTo', '_ValidFrom'].concat(this._xAxisStrategy.field),
+            fetch: ['ObjectID', '_ValidTo', '_ValidFrom'].concat([this._xAxisStrategy.field, this._typeStrategy.stateField]),
+            hydrate: [this._typeStrategy.stateField],
             find: this._getProjectScopedQuery(Ext.merge({
                 '_ValidFrom': {
                     '$gte': this.getStartOn(),
@@ -369,14 +405,14 @@ Ext.define('CustomApp', {
         var config = {
             granularity: 'hour',
             tz: this._workspaceConfig.TimeZone,
-            workDays: this._workspaceConfig.WorkDays.split(','),
+            workDays: this.getWorkDays() || this._workspaceConfig.WorkDays.split(','),
             endBefore: this.getEndBefore(),
 
             // assume 9-5
             workDayStartOn: {hour: 9, minute: 0},
             workDayEndBefore: {hour: 17, minute: 0},
 
-            holidays: this._federalHolidays(),
+            holidays: this.getHolidays() || this._federalHolidays(),
 
             trackLastValueForTheseFields: [this._xAxisStrategy.field]
         };
@@ -424,7 +460,7 @@ Ext.define('CustomApp', {
                 },
                 yAxis: [{
                     title: {
-                        text: 'Time in Process (days)'
+                        text: 'Median Time in Process (days)'
                     },
                     plotLines: [{
                         value: 0,
@@ -439,6 +475,11 @@ Ext.define('CustomApp', {
                 legend: {
                     align: 'center',
                     verticalAlign: 'bottom'
+                },
+                plotOptions: {
+                    column: {
+                        stacking: 'normal'
+                    }
                 }
             }
         });
@@ -448,18 +489,7 @@ Ext.define('CustomApp', {
     _showChartData: function(cube) {
         var categories = this._xAxisStrategy.categories;
 
-        var timeInProcessMedian = _.map(categories, function(category) {
-            var cell = cube.getCell({ category: category });
-            return cell ? cell.timeInProcessP50 : null;
-        });
-        var timeInProcessError = _.map(categories, function(category) {
-            var cell = cube.getCell({ category: category });
-            if (cell) {
-                return { low: cell.timeInProcessP25, y: cell.timeInProcessP75, high: cell.timeInProcessP75 };
-            } else {
-                return null;
-            }
-        });
+        var states = cube.getDimensionValues('state');
 
         //Call _unmask() because setLoading(false) doesn't work
         this._extChart._unmask();
@@ -469,16 +499,33 @@ Ext.define('CustomApp', {
 
         //Now we have the nice highcharts interface we all know and love
         chart.xAxis[0].setCategories(categories, true);
-        chart.addSeries({
-            name: 'Time in Process (Median)',
-            data: timeInProcessMedian,
-            color: this._extChart.chartColors[0]
-        });
-        chart.addSeries({
-            type: 'errorbar',
-            name: 'Time in Process (P25/P75)',
-            data: timeInProcessError
-        });
+
+        Ext.each(states, function(state, i) {
+
+            if (state) {
+                var timeInProcessMedian = _.map(categories, function(category) {
+                    var cell = cube.getCell({ category: category, state: state });
+                    return cell ? cell.timeInProcessP50 : null;
+                });
+
+                var timeInProcessError = _.map(categories, function(category) {
+                    var cell = cube.getCell({ category: category, state: state });
+                    if (cell) {
+                        return { low: cell.timeInProcessP25, y: cell.timeInProcessP75, high: cell.timeInProcessP75 };
+                    } else {
+                        return null;
+                    }
+                });
+
+                chart.addSeries({
+                    name: (state === 'all' ? 'Prep to Toggled On for all' : state),
+                    data: timeInProcessMedian,
+                    color: this._extChart.chartColors[i],
+                    stack: (state === 'all' ? '0' : '1')
+                });
+            }
+
+        }, this);
     },
 
     _federalHolidays: function() {
